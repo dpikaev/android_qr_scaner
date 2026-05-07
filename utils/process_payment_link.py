@@ -1,0 +1,447 @@
+import asyncio
+import json
+import os
+import time
+import uuid
+from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import aio_pika
+import cv2
+import pytesseract
+import logging
+import re
+import shlex
+import xml.etree.ElementTree as ET
+try:
+    from .find_config import get_bluestacks_instances
+except ImportError:
+    from find_config import get_bluestacks_instances
+
+from ppadb.client import Client as AdbClient
+
+logger = logging.getLogger(__name__)
+pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+
+
+@dataclass
+class PaymentScanTask:
+    payment_link: str
+    job_id: str
+
+def parse_payment_info(xml: str):
+    match = re.search(r'<\?xml.*?</hierarchy>', xml, re.DOTALL)
+    if not match:
+        raise Exception("Ошибка парса XML")
+    xml = match.group()
+    root = ET.fromstring(xml)
+    amount = None
+    purpose = None
+
+    # Поиск суммы из EditText элемента
+    for i in root.iter():
+        if i.attrib.get('class') == "android.widget.EditText":
+            text = i.attrib.get('text', '').strip()
+            if re.match(r"\d+,\d{2}", text):
+                amount = text
+                break
+
+    # Поиск назначения
+    for i in root.iter():
+        text = i.attrib.get('text', '')
+        # TODO: назначение если надо будет, сюда воткнуть можно
+
+    if not amount:
+        raise Exception("Сумма платежа не найдена")
+
+    return amount
+
+def tap_coordinates(device, x, y):
+    device.shell(f"input tap {x} {y}")
+
+def read_img_and_find_txt(device, text: str, screenshot_path: str):
+    img = cv2.imread(screenshot_path)
+    if img is None:
+        raise Exception(f"Не удалось прочитать скриншот: {screenshot_path}")
+
+    data = pytesseract.image_to_data(img, lang="rus", output_type=pytesseract.Output.DICT)
+    for i, word in enumerate(data['text']):
+        if text in word:
+            x = data['left'][i] + data['width'][i] // 2
+            y = data['top'][i] + data['height'][i] // 2
+            tap_coordinates(device, x, y)
+
+def find_target_and_click(device, target_text: str) -> bool:
+    """
+    Парс дерева и поиск элемента с заданным текстом
+    :param device:
+    :param target_text:
+    :return:
+    """
+    output = device.shell("uiautomator dump /dev/tty")
+    match = re.search(r"<\?xml.*?</hierarchy>", output, re.DOTALL)
+    print(f"Поиск XML в дереве UI")
+    if not match:
+        raise Exception("Не удалось найти XML в выводе uiautomator")
+    xml_str = match.group()
+    root = ET.fromstring(xml_str)
+
+    # Парс дочерний элемент + родитель для подъема по дереву
+    parent_map = {}
+    for parent in root.iter():
+        for child in parent:
+            parent_map[child] = parent
+
+    # Ищем элемент по тексту
+    target_element = None
+    for elem in root.iter():
+        if elem.attrib.get("text") == target_text:
+            target_element = elem
+            break
+
+    if target_element is None:
+        print(f"Элемент с текстом {target_text} не найден")
+        return False
+
+    # Поднимаемся по дереву пока не найдем кликабельный элемент
+    clickable_elem = target_element
+    while clickable_elem is not None:
+        if clickable_elem.attrib.get('clickable') == "true":
+            break
+        clickable_elem = parent_map.get(clickable_elem)
+
+    # Если не нашли в дереве кликабельный элемент - юзаем сам целевой
+    if clickable_elem is None:
+        clickable_elem = target_element
+
+    # Ищем границы элемента
+    bounds_str = clickable_elem.attrib["bounds"]
+    coords = re.match(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', bounds_str)
+    if not coords:
+        raise Exception(f"Неверный формат границ: {bounds_str}")
+
+    # Координаты центра
+    x1, y1, x2, y2 = map(int, coords.groups())
+    center_x = (x1 + x2) // 2
+    center_y = (y1 + y2) // 2
+
+    # Клик
+    device.shell(f"input tap {center_x} {center_y}")
+    print(f'Клик по координатам {center_x} {center_y} для {target_text}')
+    return True
+
+def _process_single_device(device, payment_link):
+    """
+    Обрабатывает один эмулятор: открывает ссылку, выбирает СБП, Т-Банк, извлекает сумму.
+    Возвращает словарь с результатом или выбрасывает исключение.
+    """
+    serial = device.serial.replace(':', '_').replace('.', '_')  # для имени файла
+    logger.info(f"Начало обработки на {device.serial}")
+
+    try:
+        # Открываем ссылку
+        device.shell(f"am start -a android.intent.action.VIEW -d {shlex.quote(payment_link)}")
+        time.sleep(3)  # начальное ожидание загрузки
+
+        # 1. Клик по СБП
+        ui_xml = device.shell('uiautomator dump /dev/tty').strip()
+        find_target_and_click(device, "Система быстрых платежей")
+        time.sleep(3)
+
+        # 2. Делаем скриншот, если понадобится
+        ui_xml_after_click = device.shell('uiautomator dump /dev/tty').strip()
+        screenshot_path = f"screen_after_spb_{serial}.png"
+        result = device.screencap()
+        with open(screenshot_path, "wb") as f:
+            f.write(result)
+        logger.info(f"Скриншот сохранён: {screenshot_path}")
+
+        # 3. Ищем и кликаем Т-Банк
+        t_bank_clicked = find_target_and_click(device, "Т-Банк")
+        if not t_bank_clicked:
+            read_img_and_find_txt(device, "Т-Банк", screenshot_path)
+            logger.info("Кликнули по Т-Банк через OCR")
+
+        # 4. Ждём экран с суммой и получаем XML
+        time.sleep(5)  # даём странице загрузиться
+        ui_xml_after_screen = device.shell('uiautomator dump /dev/tty').strip()
+        amount = parse_payment_info(ui_xml_after_screen)
+
+        return {
+            "device": device.serial,
+            "status": "ok",
+            "amount": amount,
+            "screenshot": screenshot_path
+        }
+
+    except Exception as e:
+        logger.error(f"Ошибка на устройстве {device.serial}: {e}")
+        return {
+            "device": device.serial,
+            "status": "error",
+            "error": str(e)
+        }
+
+
+def connect_bluestacks_devices():
+    """
+    Подключается ко всем инстансам BlueStacks и возвращает найденные ADB-устройства.
+    """
+    print("Начинаем коннект к ADB и поиск инстансов...")
+    client = AdbClient(host="127.0.0.1", port=5037)
+
+    instances = get_bluestacks_instances()
+    print(f"Найдено инстансов в конфиге: {len(instances)}")
+    for name, port in instances:
+        try:
+            client.remote_connect("127.0.0.1", port)
+            print(f"Успешно подключились к '{name}' на порту {port}")
+        except Exception as e:
+            print(f"Ошибка подключения к '{name}' (порт {port}): {e}")
+
+    devices = client.devices()
+    print(f'Всего девайсов: {devices}')
+    if not devices:
+        raise Exception("BlueStacks не найден.")
+
+    return devices
+
+
+class PaymentScanQueue:
+    """
+    RabbitMQ-очередь сканирования: один consumer-воркер закрепляется за одним эмулятором.
+    prefetch=1 не даёт воркеру взять новый QR, пока текущий не обработан.
+    """
+
+    def __init__(
+            self,
+            rabbitmq_url: str | None = None,
+            task_queue_name: str | None = None,
+    ):
+        self.rabbitmq_url = rabbitmq_url or os.getenv("RABBITMQ_URL", "amqp://guest:guest@localhost/")
+        self.task_queue_name = task_queue_name or os.getenv("PAYMENT_TASK_QUEUE", "payment_scan_tasks")
+        self.reply_queue_name = f"payment_scan_results_{uuid.uuid4().hex}"
+        self.devices = []
+        self.workers = []
+        self.started = False
+        self._start_lock = asyncio.Lock()
+        self.connection = None
+        self.publisher_channel = None
+        self.result_channel = None
+        self.task_queue = None
+        self.result_queue = None
+        self.pending_results = {}
+
+    async def start(self):
+        async with self._start_lock:
+            if self.started:
+                return
+
+            try:
+                self.connection = await aio_pika.connect_robust(self.rabbitmq_url)
+                self.publisher_channel = await self.connection.channel()
+                self.task_queue = await self.publisher_channel.declare_queue(
+                    self.task_queue_name,
+                    durable=True,
+                )
+
+                self.result_channel = await self.connection.channel()
+                self.result_queue = await self.result_channel.declare_queue(
+                    self.reply_queue_name,
+                    durable=False,
+                    exclusive=True,
+                    auto_delete=True,
+                )
+                await self.result_queue.consume(self._handle_result)
+
+                self.devices = await asyncio.to_thread(connect_bluestacks_devices)
+                self.workers = [
+                    asyncio.create_task(self._worker(device))
+                    for device in self.devices
+                ]
+                self.started = True
+                logger.info(
+                    "RabbitMQ-очередь сканирования запущена, эмуляторов: %s, queue: %s",
+                    len(self.devices),
+                    self.task_queue_name,
+                )
+            except Exception:
+                await self._close_rabbitmq()
+                raise
+
+    async def stop(self):
+        for worker in self.workers:
+            worker.cancel()
+
+        if self.workers:
+            await asyncio.gather(*self.workers, return_exceptions=True)
+
+        self.workers = []
+        self.started = False
+        for future in self.pending_results.values():
+            if not future.done():
+                future.set_exception(RuntimeError("Очередь сканирования остановлена"))
+        self.pending_results.clear()
+
+        await self._close_rabbitmq()
+
+    async def _close_rabbitmq(self):
+        if self.connection:
+            await self.connection.close()
+
+        self.connection = None
+        self.publisher_channel = None
+        self.result_channel = None
+        self.task_queue = None
+        self.result_queue = None
+
+    async def scan(self, payment_link: str):
+        if not self.started:
+            await self.start()
+
+        loop = asyncio.get_running_loop()
+        job_id = uuid.uuid4().hex
+        future = loop.create_future()
+        self.pending_results[job_id] = future
+        task = PaymentScanTask(payment_link=payment_link, job_id=job_id)
+
+        try:
+            await self.publisher_channel.default_exchange.publish(
+                aio_pika.Message(
+                    body=json.dumps(task.__dict__, ensure_ascii=False).encode("utf-8"),
+                    content_type="application/json",
+                    correlation_id=job_id,
+                    reply_to=self.reply_queue_name,
+                    delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+                ),
+                routing_key=self.task_queue_name,
+            )
+            logger.info("QR добавлен в RabbitMQ-очередь. job_id: %s", job_id)
+            return await future
+        finally:
+            self.pending_results.pop(job_id, None)
+
+    async def _worker(self, device):
+        channel = await self.connection.channel()
+        await channel.set_qos(prefetch_count=1)
+        queue = await channel.declare_queue(self.task_queue_name, durable=True)
+
+        try:
+            async with queue.iterator() as queue_iter:
+                async for message in queue_iter:
+                    async with message.process(requeue=False):
+                        payload = json.loads(message.body.decode("utf-8"))
+                        payment_link = payload["payment_link"]
+                        job_id = payload["job_id"]
+                        logger.info("Эмулятор %s взял QR из RabbitMQ. job_id: %s", device.serial, job_id)
+
+                        try:
+                            result = await asyncio.to_thread(_process_single_device, device, payment_link)
+                        except Exception as exc:
+                            logger.exception("Ошибка воркера эмулятора %s", device.serial)
+                            result = {
+                                "device": device.serial,
+                                "status": "error",
+                                "error": str(exc)
+                            }
+
+                        await self._publish_result(message.reply_to, job_id, result)
+        finally:
+            await channel.close()
+
+    async def _publish_result(self, reply_to: str | None, job_id: str, result: dict):
+        if not reply_to:
+            logger.warning("Не указана reply_to очередь для результата job_id: %s", job_id)
+            return
+
+        await self.publisher_channel.default_exchange.publish(
+            aio_pika.Message(
+                body=json.dumps({
+                    "job_id": job_id,
+                    "result": result,
+                }, ensure_ascii=False).encode("utf-8"),
+                content_type="application/json",
+                correlation_id=job_id,
+                delivery_mode=aio_pika.DeliveryMode.NOT_PERSISTENT,
+            ),
+            routing_key=reply_to,
+        )
+
+    async def _handle_result(self, message: aio_pika.IncomingMessage):
+        async with message.process(requeue=False):
+            payload = json.loads(message.body.decode("utf-8"))
+            job_id = payload.get("job_id")
+            future = self.pending_results.get(job_id)
+            if not future:
+                logger.warning("Получен результат для неизвестного job_id: %s", job_id)
+                return
+
+            if not future.done():
+                future.set_result(payload.get("result"))
+
+    async def get_status(self):
+        queue_size = None
+        if self.publisher_channel:
+            queue = await self.publisher_channel.declare_queue(
+                self.task_queue_name,
+                durable=True,
+                passive=True,
+            )
+            queue_size = queue.declaration_result.message_count
+
+        return {
+            "started": self.started,
+            "rabbitmq_configured": bool(self.rabbitmq_url),
+            "task_queue": self.task_queue_name,
+            "devices": [device.serial for device in self.devices],
+            "queue_size": queue_size,
+            "pending_results": len(self.pending_results),
+        }
+
+
+def process_payment_link(payment_link: str):
+    """
+    Совместимость для ручного запуска: обрабатывает одну ссылку на первом доступном эмуляторе.
+    Для FastAPI используется PaymentScanQueue, чтобы распределять разные QR по свободным эмуляторам.
+    """
+    devices = connect_bluestacks_devices()
+    device = devices[0]
+    print(f"Обработка ссылки на одном устройстве: {device.serial}")
+    return _process_single_device(device, payment_link)
+
+
+def process_payment_link_on_all_devices(payment_link: str):
+    """
+    Старый режим: запускает одну ссылку на всех эмуляторах параллельно.
+    Оставлен только для диагностики.
+    """
+    devices = connect_bluestacks_devices()
+
+    # Запускаем обработку параллельно
+    results = []
+    with ThreadPoolExecutor(max_workers=len(devices)) as executor:
+        # Создаём задачи для каждого устройства
+        future_to_device = {
+            executor.submit(_process_single_device, device, payment_link): device
+            for device in devices
+        }
+
+        for future in as_completed(future_to_device):
+            device = future_to_device[future]
+            try:
+                result = future.result()
+                results.append(result)
+                print(f"Завершена обработка {device.serial}: {result.get('amount')}")
+            except Exception as exc:
+                print(f"Устройство {device.serial} сгенерировало исключение: {exc}")
+                results.append({"device": device.serial, "status": "error", "error": str(exc)})
+
+    return results
+
+
+# Тестовый вызов
+if __name__ == "__main__":
+    payment = "https://qr.nspk.ru/AD100001GDO3ABN29LNQLSG3C1U4OE0R"
+    result = process_payment_link(payment)
+    print("\nИтоговые результаты:")
+    print(result)

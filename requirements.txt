@@ -1,0 +1,6 @@
+aio-pika
+fastapi
+opencv-python
+pure-python-adb
+pytesseract
+uvicorn
