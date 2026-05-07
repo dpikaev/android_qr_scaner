@@ -71,6 +71,60 @@ def read_img_and_find_txt(device, text: str, screenshot_path: str):
             y = data['top'][i] + data['height'][i] // 2
             tap_coordinates(device, x, y)
 
+
+def normalize_ocr_text(text: str) -> str:
+    return re.sub(r"[^0-9a-zа-яё]+", "", text.lower())
+
+
+def take_screenshot(device, screenshot_path: str):
+    result = device.screencap()
+    with open(screenshot_path, "wb") as f:
+        f.write(result)
+
+
+def find_phrase_on_screenshot_and_click(device, phrase: str, screenshot_path: str) -> bool:
+    take_screenshot(device, screenshot_path)
+    img = cv2.imread(screenshot_path)
+    if img is None:
+        raise Exception(f"Не удалось прочитать скриншот: {screenshot_path}")
+
+    data = pytesseract.image_to_data(img, lang="rus", output_type=pytesseract.Output.DICT)
+    target_words = [normalize_ocr_text(word) for word in phrase.split()]
+    target_words = [word for word in target_words if word]
+
+    recognized_words = []
+    for i, word in enumerate(data["text"]):
+        normalized_word = normalize_ocr_text(word)
+        if not normalized_word:
+            continue
+
+        recognized_words.append({
+            "text": normalized_word,
+            "left": data["left"][i],
+            "top": data["top"][i],
+            "width": data["width"][i],
+            "height": data["height"][i],
+        })
+
+    for start_idx in range(len(recognized_words) - len(target_words) + 1):
+        phrase_words = recognized_words[start_idx:start_idx + len(target_words)]
+        if [word["text"] for word in phrase_words] != target_words:
+            continue
+
+        left = min(word["left"] for word in phrase_words)
+        top = min(word["top"] for word in phrase_words)
+        right = max(word["left"] + word["width"] for word in phrase_words)
+        bottom = max(word["top"] + word["height"] for word in phrase_words)
+        x = (left + right) // 2
+        y = (top + bottom) // 2
+        tap_coordinates(device, x, y)
+        print(f"Клик по OCR-координатам {x} {y} для {phrase}")
+        return True
+
+    print(f"Фраза {phrase} не найдена на скриншоте {screenshot_path}")
+    return False
+
+
 def find_target_and_click(device, target_text: str) -> bool:
     """
     Парс дерева и поиск элемента с заданным текстом
@@ -161,7 +215,13 @@ def find_target_and_click_with_scroll(device, target_text: str, max_scrolls: int
     Ищет элемент на текущем экране и ниже по странице.
     Если элемент не найден, возвращает экран примерно в исходное положение.
     """
+    serial = device.serial.replace(':', '_').replace('.', '_')
+    screenshot_path = f"screen_{normalize_ocr_text(target_text)}_{serial}.png"
+
     if find_target_and_click(device, target_text):
+        return True
+
+    if find_phrase_on_screenshot_and_click(device, target_text, screenshot_path):
         return True
 
     scrolls_done = 0
@@ -171,6 +231,9 @@ def find_target_and_click_with_scroll(device, target_text: str, max_scrolls: int
         time.sleep(1.5)
 
         if find_target_and_click(device, target_text):
+            return True
+
+        if find_phrase_on_screenshot_and_click(device, target_text, screenshot_path):
             return True
 
     for _ in range(scrolls_done):
