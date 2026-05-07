@@ -141,7 +141,7 @@ def find_target_and_click_with_scroll(device, target_text: str, max_scrolls: int
 
     scrolls_done = 0
     for _ in range(max_scrolls):
-        device.shell("input swipe 500 1500 500 500 500")
+        device.shell("input swipe 500 500 500 1500 500")
         scrolls_done += 1
         time.sleep(1)
 
@@ -149,7 +149,7 @@ def find_target_and_click_with_scroll(device, target_text: str, max_scrolls: int
             return True
 
     for _ in range(scrolls_done):
-        device.shell("input swipe 500 500 500 1500 500")
+        device.shell("input swipe 500 1500 500 500 500")
         time.sleep(0.5)
 
     return False
