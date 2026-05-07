@@ -56,6 +56,19 @@ def parse_payment_info(xml: str):
 
     return amount
 
+
+def wait_for_payment_amount(device, attempts: int = 6, delay: float = 2):
+    last_error = None
+    for _ in range(attempts):
+        ui_xml = device.shell('uiautomator dump /dev/tty').strip()
+        try:
+            return parse_payment_info(ui_xml)
+        except Exception as e:
+            last_error = e
+            time.sleep(delay)
+
+    raise last_error
+
 def tap_coordinates(device, x, y):
     device.shell(f"input tap {x} {y}")
 
@@ -216,7 +229,7 @@ def find_target_and_click_with_scroll(device, target_text: str, max_scrolls: int
     Если элемент не найден, возвращает экран примерно в исходное положение.
     """
     serial = device.serial.replace(':', '_').replace('.', '_')
-    screenshot_path = f"screen_{normalize_ocr_text(target_text)}_{serial}.png"
+    screenshot_path = f"screen_browser_button_{serial}.png"
 
     if find_target_and_click(device, target_text):
         return True
@@ -283,8 +296,7 @@ def _process_single_device(device, payment_link):
             time.sleep(3)
 
         # 5. Получаем XML экрана с суммой
-        ui_xml_after_screen = device.shell('uiautomator dump /dev/tty').strip()
-        amount = parse_payment_info(ui_xml_after_screen)
+        amount = wait_for_payment_amount(device)
 
         return {
             "device": device.serial,
