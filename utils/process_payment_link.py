@@ -29,6 +29,30 @@ class PaymentScanTask:
     payment_link: str
     job_id: str
 
+def extract_amount_from_text(text: str) -> str | None:
+    cleaned_text = text.replace("\u00a0", " ").strip()
+    if not cleaned_text:
+        return None
+
+    has_money_marker = bool(re.search(r"(₽|руб|р\.)", cleaned_text, re.IGNORECASE))
+    amount_match = re.search(r"(?<!\d)(\d{1,3}(?:\s\d{3})*|\d+)(?:[,.](\d{1,2}))?(?!\d)", cleaned_text)
+    if not amount_match:
+        return None
+
+    # Без валютного маркера берём только явные суммы с копейками, чтобы не спутать с другими числами.
+    if not has_money_marker and amount_match.group(2) is None:
+        return None
+
+    rubles = amount_match.group(1).replace(" ", "")
+    kopecks = amount_match.group(2)
+    if kopecks is None:
+        kopecks = "00"
+    else:
+        kopecks = kopecks.ljust(2, "0")
+
+    return f"{rubles},{kopecks}"
+
+
 def parse_payment_info(xml: str):
     match = re.search(r'<\?xml.*?</hierarchy>', xml, re.DOTALL)
     if not match:
@@ -42,9 +66,39 @@ def parse_payment_info(xml: str):
     for i in root.iter():
         if i.attrib.get('class') == "android.widget.EditText":
             text = i.attrib.get('text', '').strip()
-            if re.match(r"\d+,\d{2}", text):
-                amount = text
+            amount = extract_amount_from_text(text)
+            if amount:
                 break
+
+    if not amount:
+        elements_text = []
+        for elem in root.iter():
+            texts = [
+                elem.attrib.get('text', '').strip(),
+                elem.attrib.get('content-desc', '').strip(),
+            ]
+            text = " ".join(item for item in texts if item)
+            if text:
+                elements_text.append(text)
+
+        pay_button_index = None
+        for index, text in enumerate(elements_text):
+            if "оплатить" in text.lower():
+                pay_button_index = index
+                break
+
+        # На экране банка сумма находится в текстовом блоке прямо над кнопкой оплаты.
+        if pay_button_index is not None:
+            for text in reversed(elements_text[:pay_button_index]):
+                amount = extract_amount_from_text(text)
+                if amount:
+                    break
+
+        if not amount:
+            for text in elements_text:
+                amount = extract_amount_from_text(text)
+                if amount:
+                    break
 
     # Поиск назначения
     for i in root.iter():
