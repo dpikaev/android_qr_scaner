@@ -160,12 +160,12 @@ async def extract_link(request: Request) -> str:
     if isinstance(body, str):
         link = body
     elif isinstance(body, dict):
-        link = body.get("link")
+        link = body.get("url") or body.get("link")
     else:
         link = None
 
     if not link or not isinstance(link, str):
-        raise HTTPException(status_code=400, detail="Передайте QR-ссылку строкой или JSON-объектом {'link': '...'}")
+        raise HTTPException(status_code=400, detail="Передайте QR-ссылку строкой или JSON-объектом {'url': '...'}")
 
     return link
 
