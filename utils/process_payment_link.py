@@ -34,7 +34,7 @@ def extract_amount_from_text(text: str) -> str | None:
     if not cleaned_text:
         return None
 
-    has_money_marker = bool(re.search(r"(₽|руб|р\.)", cleaned_text, re.IGNORECASE))
+    has_money_marker = bool(re.search(r"(₽|руб|р\.?|\bp\b)", cleaned_text, re.IGNORECASE))
     amount_match = re.search(r"(?<!\d)(\d{1,3}(?:\s\d{3})*|\d+)(?:[,.](\d{1,2}))?(?!\d)", cleaned_text)
     if not amount_match:
         return None
@@ -114,6 +114,9 @@ def parse_payment_info(xml: str):
 def wait_for_payment_amount(device, attempts: int = 6, delay: float = 2):
     last_error = None
     last_xml = None
+    last_ocr_text = None
+    serial = device.serial.replace(':', '_').replace('.', '_')
+    screenshot_path = f"screen_amount_{serial}.png"
     for attempt in range(1, attempts + 1):
         ui_xml = device.shell('uiautomator dump /dev/tty').strip()
         last_xml = ui_xml
@@ -122,12 +125,27 @@ def wait_for_payment_amount(device, attempts: int = 6, delay: float = 2):
         except Exception as e:
             last_error = e
             logger.warning("Сумма не найдена в XML, попытка %s/%s: %s", attempt, attempts, e)
+
+        try:
+            amount, ocr_text = find_amount_on_screenshot(device, screenshot_path)
+            last_ocr_text = ocr_text
+            if amount:
+                logger.info("Сумма найдена через OCR со скриншота: %s", amount)
+                return amount
+        except Exception as e:
+            logger.warning("Сумма не найдена через OCR, попытка %s/%s: %s", attempt, attempts, e)
+
+        if attempt < attempts:
             time.sleep(delay)
 
     logger.error("XML экрана, где сумма не найдена:\n%s", last_xml)
+    logger.error("OCR текст экрана, где сумма не найдена:\n%s", last_ocr_text)
     print("\n===== XML ЭКРАНА, ГДЕ СУММА НЕ НАЙДЕНА =====")
     print(last_xml)
     print("===== КОНЕЦ XML ЭКРАНА =====\n")
+    print("\n===== OCR ТЕКСТ ЭКРАНА, ГДЕ СУММА НЕ НАЙДЕНА =====")
+    print(last_ocr_text)
+    print("===== КОНЕЦ OCR ТЕКСТА =====\n")
     raise last_error
 
 def tap_coordinates(device, x, y):
@@ -154,6 +172,48 @@ def take_screenshot(device, screenshot_path: str):
     result = device.screencap()
     with open(screenshot_path, "wb") as f:
         f.write(result)
+
+
+def find_amount_on_screenshot(device, screenshot_path: str) -> tuple[str | None, str]:
+    take_screenshot(device, screenshot_path)
+    img = cv2.imread(screenshot_path)
+    if img is None:
+        raise Exception(f"Не удалось прочитать скриншот: {screenshot_path}")
+
+    data = pytesseract.image_to_data(img, lang="rus", output_type=pytesseract.Output.DICT)
+    lines = {}
+    for i, word in enumerate(data["text"]):
+        word = word.strip()
+        if not word:
+            continue
+
+        line_key = (
+            data["block_num"][i],
+            data["par_num"][i],
+            data["line_num"][i],
+        )
+        lines.setdefault(line_key, []).append({
+            "text": word,
+            "left": data["left"][i],
+            "top": data["top"][i],
+        })
+
+    ordered_lines = []
+    for words in lines.values():
+        words.sort(key=lambda item: item["left"])
+        line_text = " ".join(item["text"] for item in words)
+        line_top = min(item["top"] for item in words)
+        ordered_lines.append((line_top, line_text))
+
+    ordered_lines.sort(key=lambda item: item[0])
+    ocr_lines = [line_text for _, line_text in ordered_lines]
+
+    for line_text in ocr_lines:
+        amount = extract_amount_from_text(line_text)
+        if amount:
+            return amount, "\n".join(ocr_lines)
+
+    return None, "\n".join(ocr_lines)
 
 
 def find_phrase_on_screenshot_and_click(device, phrase: str, screenshot_path: str) -> bool:
