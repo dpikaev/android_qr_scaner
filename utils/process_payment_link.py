@@ -113,14 +113,21 @@ def parse_payment_info(xml: str):
 
 def wait_for_payment_amount(device, attempts: int = 6, delay: float = 2):
     last_error = None
-    for _ in range(attempts):
+    last_xml = None
+    for attempt in range(1, attempts + 1):
         ui_xml = device.shell('uiautomator dump /dev/tty').strip()
+        last_xml = ui_xml
         try:
             return parse_payment_info(ui_xml)
         except Exception as e:
             last_error = e
+            logger.warning("Сумма не найдена в XML, попытка %s/%s: %s", attempt, attempts, e)
             time.sleep(delay)
 
+    logger.error("XML экрана, где сумма не найдена:\n%s", last_xml)
+    print("\n===== XML ЭКРАНА, ГДЕ СУММА НЕ НАЙДЕНА =====")
+    print(last_xml)
+    print("===== КОНЕЦ XML ЭКРАНА =====\n")
     raise last_error
 
 def tap_coordinates(device, x, y):
