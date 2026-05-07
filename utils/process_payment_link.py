@@ -131,6 +131,31 @@ def find_target_and_click(device, target_text: str) -> bool:
     return True
 
 
+def get_screen_size(device) -> tuple[int, int]:
+    output = device.shell("wm size")
+    match = re.search(r"Physical size:\s*(\d+)x(\d+)", output)
+    if not match:
+        return 1080, 1920
+
+    return int(match.group(1)), int(match.group(2))
+
+
+def scroll_page_down(device):
+    width, height = get_screen_size(device)
+    x = width // 2
+    start_y = int(height * 0.8)
+    end_y = int(height * 0.25)
+    device.shell(f"input touchscreen swipe {x} {start_y} {x} {end_y} 700")
+
+
+def scroll_page_up(device):
+    width, height = get_screen_size(device)
+    x = width // 2
+    start_y = int(height * 0.25)
+    end_y = int(height * 0.8)
+    device.shell(f"input touchscreen swipe {x} {start_y} {x} {end_y} 700")
+
+
 def find_target_and_click_with_scroll(device, target_text: str, max_scrolls: int = 3) -> bool:
     """
     Ищет элемент на текущем экране и ниже по странице.
@@ -141,16 +166,16 @@ def find_target_and_click_with_scroll(device, target_text: str, max_scrolls: int
 
     scrolls_done = 0
     for _ in range(max_scrolls):
-        device.shell("input swipe 500 500 500 1500 500")
+        scroll_page_down(device)
         scrolls_done += 1
-        time.sleep(1)
+        time.sleep(1.5)
 
         if find_target_and_click(device, target_text):
             return True
 
     for _ in range(scrolls_done):
-        device.shell("input swipe 500 1500 500 500 500")
-        time.sleep(0.5)
+        scroll_page_up(device)
+        time.sleep(0.7)
 
     return False
 
