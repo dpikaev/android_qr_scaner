@@ -130,6 +130,31 @@ def find_target_and_click(device, target_text: str) -> bool:
     print(f'Клик по координатам {center_x} {center_y} для {target_text}')
     return True
 
+
+def find_target_and_click_with_scroll(device, target_text: str, max_scrolls: int = 3) -> bool:
+    """
+    Ищет элемент на текущем экране и ниже по странице.
+    Если элемент не найден, возвращает экран примерно в исходное положение.
+    """
+    if find_target_and_click(device, target_text):
+        return True
+
+    scrolls_done = 0
+    for _ in range(max_scrolls):
+        device.shell("input swipe 500 1500 500 500 500")
+        scrolls_done += 1
+        time.sleep(1)
+
+        if find_target_and_click(device, target_text):
+            return True
+
+    for _ in range(scrolls_done):
+        device.shell("input swipe 500 500 500 1500 500")
+        time.sleep(0.5)
+
+    return False
+
+
 def _process_single_device(device, payment_link):
     """
     Обрабатывает один эмулятор: открывает ссылку, выбирает СБП, Т-Банк, извлекает сумму.
@@ -162,8 +187,14 @@ def _process_single_device(device, payment_link):
             read_img_and_find_txt(device, "Т-Банк", screenshot_path)
             logger.info("Кликнули по Т-Банк через OCR")
 
-        # 4. Ждём экран с суммой и получаем XML
+        # 4. Проверяем промежуточную кнопку банка перед поиском суммы
         time.sleep(5)  # даём странице загрузиться
+        browser_button_clicked = find_target_and_click_with_scroll(device, "Здесь, в браузере")
+        if browser_button_clicked:
+            logger.info("Кликнули по кнопке 'Здесь, в браузере'")
+            time.sleep(3)
+
+        # 5. Получаем XML экрана с суммой
         ui_xml_after_screen = device.shell('uiautomator dump /dev/tty').strip()
         amount = parse_payment_info(ui_xml_after_screen)
 
