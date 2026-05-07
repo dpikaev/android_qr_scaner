@@ -276,6 +276,14 @@ def scroll_page_down(device):
     device.shell(f"input touchscreen swipe {x} {start_y} {x} {end_y} 700")
 
 
+def scroll_page_down_light(device):
+    width, height = get_screen_size(device)
+    x = width // 2
+    start_y = int(height * 0.65)
+    end_y = int(height * 0.45)
+    device.shell(f"input touchscreen swipe {x} {start_y} {x} {end_y} 500")
+
+
 def scroll_page_up(device):
     width, height = get_screen_size(device)
     x = width // 2
@@ -292,28 +300,40 @@ def find_target_and_click_with_scroll(device, target_text: str, max_scrolls: int
     serial = device.serial.replace(':', '_').replace('.', '_')
     screenshot_path = f"screen_browser_button_{serial}.png"
 
-    if find_target_and_click(device, target_text):
-        return True
-
-    if find_phrase_on_screenshot_and_click(device, target_text, screenshot_path):
-        return True
-
     scrolls_done = 0
     for _ in range(max_scrolls):
         scroll_page_down(device)
         scrolls_done += 1
         time.sleep(1.5)
 
-        if find_target_and_click(device, target_text):
+        if find_phrase_on_screenshot_and_click(device, target_text, screenshot_path):
             return True
 
-        if find_phrase_on_screenshot_and_click(device, target_text, screenshot_path):
+        if find_target_and_click(device, target_text):
             return True
 
     for _ in range(scrolls_done):
         scroll_page_up(device)
         time.sleep(0.7)
 
+    return False
+
+
+def find_target_and_click_with_light_scroll(device, target_text: str, screenshot_prefix: str) -> bool:
+    serial = device.serial.replace(':', '_').replace('.', '_')
+    screenshot_path = f"{screenshot_prefix}_{serial}.png"
+
+    scroll_page_down_light(device)
+    time.sleep(1)
+
+    if find_phrase_on_screenshot_and_click(device, target_text, screenshot_path):
+        return True
+
+    if find_target_and_click(device, target_text):
+        return True
+
+    scroll_page_up(device)
+    time.sleep(0.7)
     return False
 
 
@@ -356,7 +376,17 @@ def _process_single_device(device, payment_link):
             logger.info("Кликнули по кнопке 'Здесь, в браузере'")
             time.sleep(3)
 
-        # 5. Получаем XML экрана с суммой
+        # 5. Если банк предлагает привязать счёт, пропускаем этот шаг
+        skip_account_link_clicked = find_target_and_click_with_light_scroll(
+            device,
+            "Не нужно",
+            "screen_skip_account_link",
+        )
+        if skip_account_link_clicked:
+            logger.info("Кликнули по кнопке 'Не нужно'")
+            time.sleep(3)
+
+        # 6. Получаем XML экрана с суммой
         amount = wait_for_payment_amount(device)
 
         return {
