@@ -29,18 +29,33 @@ class PaymentScanTask:
     payment_link: str
     job_id: str
 
-def extract_amount_from_text(text: str) -> str | None:
+def extract_amount_from_text(
+        text: str,
+        allow_integer_without_marker: bool = False,
+) -> str | None:
     cleaned_text = text.replace("\u00a0", " ").strip()
     if not cleaned_text:
         return None
 
-    has_money_marker = bool(re.search(r"(₽|руб|р\.?|\bp\b)", cleaned_text, re.IGNORECASE))
-    amount_match = re.search(r"(?<!\d)(\d{1,3}(?:\s\d{3})*|\d+)(?:[,.](\d{1,2}))?(?!\d)", cleaned_text)
+    money_amount_match = re.search(
+        r"(?<!\d)(\d{1,3}(?:\s\d{3})*|\d+)(?:[,.](\d{1,2}))?\s*(?:₽|руб\.?|р\.?|p\.?)(?![a-zа-яё])",
+        cleaned_text,
+        re.IGNORECASE,
+    )
+    if money_amount_match:
+        amount_match = money_amount_match
+    else:
+        amount_match = re.search(
+            r"(?<!\d)(\d{1,3}(?:\s\d{3})*|\d+)(?:[,.](\d{1,2}))?(?!\d)",
+            cleaned_text,
+        )
+
+    has_money_marker = money_amount_match is not None
     if not amount_match:
         return None
 
     # Без валютного маркера берём только явные суммы с копейками, чтобы не спутать с другими числами.
-    if not has_money_marker and amount_match.group(2) is None:
+    if not has_money_marker and amount_match.group(2) is None and not allow_integer_without_marker:
         return None
 
     rubles = amount_match.group(1).replace(" ", "")
@@ -131,6 +146,10 @@ def wait_for_payment_amount(device, attempts: int = 6, delay: float = 2):
             last_ocr_text = ocr_text
             if amount:
                 logger.info("Сумма найдена через OCR со скриншота: %s", amount)
+                logger.info("OCR текст экрана, где сумма найдена:\n%s", ocr_text)
+                print("\n===== OCR ТЕКСТ ЭКРАНА, ГДЕ СУММА НАЙДЕНА =====")
+                print(ocr_text)
+                print("===== КОНЕЦ OCR ТЕКСТА =====\n")
                 return amount
         except Exception as e:
             logger.warning("Сумма не найдена через OCR, попытка %s/%s: %s", attempt, attempts, e)
@@ -196,6 +215,7 @@ def find_amount_on_screenshot(device, screenshot_path: str) -> tuple[str | None,
             "text": word,
             "left": data["left"][i],
             "top": data["top"][i],
+            "height": data["height"][i],
         })
 
     ordered_lines = []
@@ -203,15 +223,47 @@ def find_amount_on_screenshot(device, screenshot_path: str) -> tuple[str | None,
         words.sort(key=lambda item: item["left"])
         line_text = " ".join(item["text"] for item in words)
         line_top = min(item["top"] for item in words)
-        ordered_lines.append((line_top, line_text))
+        line_bottom = max(item["top"] + item["height"] for item in words)
+        ordered_lines.append({
+            "text": line_text,
+            "top": line_top,
+            "bottom": line_bottom,
+        })
 
-    ordered_lines.sort(key=lambda item: item[0])
-    ocr_lines = [line_text for _, line_text in ordered_lines]
+    ordered_lines.sort(key=lambda item: item["top"])
+    ocr_lines = [line["text"] for line in ordered_lines]
 
-    for line_text in ocr_lines:
-        amount = extract_amount_from_text(line_text)
+    pay_button_line = None
+    for line in ordered_lines:
+        normalized_line = normalize_ocr_text(line["text"])
+        if "оплат" in normalized_line:
+            pay_button_line = line
+            break
+
+    amount_candidates = []
+    search_lines = ordered_lines
+    if pay_button_line:
+        search_lines = [
+            line
+            for line in ordered_lines
+            if 120 < line["top"] < pay_button_line["top"]
+        ]
+
+    for line in reversed(search_lines):
+        amount = extract_amount_from_text(line["text"])
         if amount:
             return amount, "\n".join(ocr_lines)
+
+        amount = extract_amount_from_text(line["text"], allow_integer_without_marker=bool(pay_button_line))
+        if amount:
+            rubles = int(amount.split(",", 1)[0])
+            if rubles >= 10:
+                distance_to_pay_button = pay_button_line["top"] - line["bottom"] if pay_button_line else 0
+                amount_candidates.append((distance_to_pay_button, rubles, amount))
+
+    if amount_candidates:
+        amount_candidates.sort(key=lambda item: (item[0], -item[1]))
+        return amount_candidates[0][2], "\n".join(ocr_lines)
 
     return None, "\n".join(ocr_lines)
 
